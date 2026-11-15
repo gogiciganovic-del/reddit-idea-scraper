@@ -1,23 +1,26 @@
 #!/usr/bin/env python3
 """
-Tjedni Reddit skener pritužbi i poslovnih ideja.
+Tjedni Reddit skener pritužbi i poslovnih ideja — v2.
 
 NE treba Reddit API app/ključ. Koristi Redditove javne, besplatne JSON
-feedove (npr. https://www.reddit.com/r/croatia/new.json) koji su
-dostupni bez prijave i bez OAuth-a — dovoljan je samo pristojan
-User-Agent header. Reddit je u 2026. zatvorio izradu novih "legacy API"
-script-aplikacija za obične korisnike (samo za moderacijske slučajeve
-uz odobrenje), pa ovaj pristup zaobilazi tu prepreku i dalje ostaje
-100% besplatan.
+feedove (new.json, top.json, comments.json) koji su dostupni bez
+prijave i bez OAuth-a — dovoljan je samo pristojan User-Agent header.
+
+Što je novo u v2:
+  - širi popis fraza (formalno + neformalno, hrvatski + engleski)
+  - skenira i KOMENTARE, ne samo naslove postova (comments.json)
+  - dodaje "top tjedna" uz "najnovije", da se ne promaše popularne teme
+  - composite_score rangiranje (glasovi + komentari + broj poklopljenih
+    fraza) umjesto plošnog popisa
+  - prati ponavljaju li se iste fraze kroz više različitih tjedana
+    (jači signal prave poslovne prilike nego jednokratan spomen)
 
 Izlaz:
-  data/latest.csv   — svi pogoci (sirovi podaci)
-  data/summary.md   — sažetak na vrhu (top pogoci + učestale teme)
-  data/history.csv  — kumulativna povijest (append, dedup po post id-u)
+  data/latest.csv   — svi pogoci iz zadnjeg pokretanja (sirovi podaci)
+  data/summary.md   — sažetak na vrhu (top pogoci, ponavljajuće teme)
+  data/history.csv  — kumulativna povijest (append, dedup po id-u)
 
-Pokreće se tjedno preko GitHub Actions (.github/workflows/reddit-scan.yml),
-potpuno besplatno na GitHub-ovoj infrastrukturi (koja ima pun pristup
-internetu, za razliku od nekih sandboxed okruženja).
+Pokreće se tjedno preko GitHub Actions (.github/workflows/reddit-scan.yml).
 """
 
 import csv
@@ -25,21 +28,36 @@ import os
 import re
 import sys
 import time
-from collections import Counter
+from collections import Counter, defaultdict
 from datetime import datetime, timezone
 
 import requests
 
-from config import SUBREDDITS, POSTS_PER_SUBREDDIT, KEYWORDS, CJENKO_RELEVANT_HINTS
+from config import (
+    SUBREDDITS,
+    POSTS_PER_SUBREDDIT,
+    COMMENTS_PER_SUBREDDIT,
+    TOP_WEEK_PER_SUBREDDIT,
+    KEYWORDS,
+    CJENKO_RELEVANT_HINTS,
+    RECURRING_MIN_WEEKS,
+)
 
 DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), "data")
 LATEST_CSV = os.path.join(DATA_DIR, "latest.csv")
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 SUMMARY_MD = os.path.join(DATA_DIR, "summary.md")
 
-USER_AGENT = "cjenko-idea-scanner/1.0 (besplatni istrazivacki skener, by u/gogiciganovic-del)"
-REQUEST_DELAY_SECONDS = 2.5  # pristojan razmak između zahtjeva prema Redditu
-PAGE_SIZE = 100  # max koji Reddit dopušta po stranici
+USER_AGENT = "cjenko-idea-scanner/2.0 (besplatni istrazivacki skener, by u/gogiciganovic-del)"
+REQUEST_DELAY_SECONDS = 2.5
+PAGE_SIZE = 100
+
+FIELDNAMES = [
+    "post_id", "scanned_at", "group", "subreddit", "content_type",
+    "buckets", "matched_keywords", "cjenko_relevant", "reddit_score",
+    "num_comments", "composite_score", "created_utc", "title",
+    "snippet", "url",
+]
 
 STOPWORDS = set(
     "i the a an of to for in on is are was were be been and or but with "
@@ -50,26 +68,33 @@ STOPWORDS = set(
     .split()
 )
 
+_session = requests.Session()
+_session.headers.update({"User-Agent": USER_AGENT})
 
-def fetch_new_posts(sub_name, limit):
-    """Dohvati najnovije postove s r/<sub_name> preko javnog .json feeda."""
-    posts = []
-    after = None
-    session = requests.Session()
-    session.headers.update({"User-Agent": USER_AGENT})
 
-    while len(posts) < limit:
-        url = f"https://www.reddit.com/r/{sub_name}/new.json"
-        params = {"limit": min(PAGE_SIZE, limit - len(posts))}
-        if after:
-            params["after"] = after
-        resp = session.get(url, params=params, timeout=15)
+def _get(url, params):
+    while True:
+        resp = _session.get(url, params=params, timeout=15)
         if resp.status_code == 429:
-            print(f"[upozorenje] {sub_name}: rate-limited, čekam 10s...", file=sys.stderr)
+            print(f"[upozorenje] rate-limited na {url}, čekam 10s...", file=sys.stderr)
             time.sleep(10)
             continue
         resp.raise_for_status()
-        data = resp.json()
+        return resp.json()
+
+
+def fetch_posts(sub_name, listing, limit, extra_params=None):
+    """listing: 'new' ili 'top'."""
+    posts = []
+    after = None
+    while len(posts) < limit:
+        url = f"https://www.reddit.com/r/{sub_name}/{listing}.json"
+        params = {"limit": min(PAGE_SIZE, limit - len(posts))}
+        if extra_params:
+            params.update(extra_params)
+        if after:
+            params["after"] = after
+        data = _get(url, params)
         children = data.get("data", {}).get("children", [])
         if not children:
             break
@@ -79,8 +104,28 @@ def fetch_new_posts(sub_name, limit):
         if not after:
             break
         time.sleep(REQUEST_DELAY_SECONDS)
-
     return posts
+
+
+def fetch_comments(sub_name, limit):
+    comments = []
+    after = None
+    while len(comments) < limit:
+        url = f"https://www.reddit.com/r/{sub_name}/comments.json"
+        params = {"limit": min(PAGE_SIZE, limit - len(comments))}
+        if after:
+            params["after"] = after
+        data = _get(url, params)
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            break
+        for child in children:
+            comments.append(child["data"])
+        after = data.get("data", {}).get("after")
+        if not after:
+            break
+        time.sleep(REQUEST_DELAY_SECONDS)
+    return comments
 
 
 def find_matches(text):
@@ -98,6 +143,17 @@ def is_cjenko_relevant(text):
     return any(hint in text_l for hint in CJENKO_RELEVANT_HINTS)
 
 
+def comment_url(sub_name, comment):
+    permalink = comment.get("permalink")
+    if permalink:
+        return f"https://www.reddit.com{permalink}"
+    link_permalink = comment.get("link_permalink")
+    if link_permalink:
+        return f"{link_permalink.rstrip('/')}/{comment.get('id', '')}/"
+    link_id = (comment.get("link_id") or "").split("_")[-1]
+    return f"https://www.reddit.com/r/{sub_name}/comments/{link_id}/_/{comment.get('id', '')}/"
+
+
 def load_existing_ids():
     if not os.path.exists(HISTORY_CSV):
         return set()
@@ -105,59 +161,99 @@ def load_existing_ids():
         return {row["post_id"] for row in csv.DictReader(f)}
 
 
+def make_row(group, sub_name, content_type, item_id, title, body, reddit_score,
+             num_comments, created_utc, url, hits):
+    buckets = sorted({b for b, _ in hits})
+    matched_phrases = sorted({p for _, p in hits})
+    composite = reddit_score + num_comments + 25 * len(matched_phrases)
+    full_text = f"{title}\n{body}"
+    return {
+        "post_id": item_id,
+        "scanned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
+        "group": group,
+        "subreddit": sub_name,
+        "content_type": content_type,
+        "buckets": ";".join(buckets),
+        "matched_keywords": ";".join(matched_phrases),
+        "cjenko_relevant": "da" if is_cjenko_relevant(full_text) else "ne",
+        "reddit_score": reddit_score,
+        "num_comments": num_comments,
+        "composite_score": composite,
+        "created_utc": datetime.fromtimestamp(created_utc, tz=timezone.utc).isoformat(timespec="seconds"),
+        "title": title.replace("\n", " ").strip(),
+        "snippet": body[:300].replace("\n", " ").strip(),
+        "url": url,
+    }
+
+
 def scan():
     rows = []
 
     for group, subs in SUBREDDITS.items():
         for sub_name in subs:
+            # 1) najnoviji postovi
             try:
-                posts = fetch_new_posts(sub_name, POSTS_PER_SUBREDDIT)
-                for post in posts:
+                for post in fetch_posts(sub_name, "new", POSTS_PER_SUBREDDIT):
                     title = post.get("title", "") or ""
                     selftext = post.get("selftext", "") or ""
-                    full_text = f"{title}\n{selftext}"
-                    hits = find_matches(full_text)
+                    hits = find_matches(f"{title}\n{selftext}")
                     if not hits:
                         continue
-                    buckets = sorted({b for b, _ in hits})
-                    matched_phrases = sorted({p for _, p in hits})
-                    rows.append(
-                        {
-                            "post_id": post.get("id", ""),
-                            "scanned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                            "group": group,
-                            "subreddit": sub_name,
-                            "buckets": ";".join(buckets),
-                            "matched_keywords": ";".join(matched_phrases),
-                            "cjenko_relevant": "da" if is_cjenko_relevant(full_text) else "ne",
-                            "score": post.get("score", 0),
-                            "num_comments": post.get("num_comments", 0),
-                            "created_utc": datetime.fromtimestamp(
-                                post.get("created_utc", 0), tz=timezone.utc
-                            ).isoformat(timespec="seconds"),
-                            "title": title.replace("\n", " ").strip(),
-                            "snippet": selftext[:300].replace("\n", " ").strip(),
-                            "url": f"https://www.reddit.com{post.get('permalink', '')}",
-                        }
-                    )
+                    rows.append(make_row(
+                        group, sub_name, "post", post.get("id", ""), title, selftext,
+                        post.get("score", 0), post.get("num_comments", 0),
+                        post.get("created_utc", 0),
+                        f"https://www.reddit.com{post.get('permalink', '')}", hits,
+                    ))
                 time.sleep(REQUEST_DELAY_SECONDS)
-            except Exception as e:  # ne prekidaj cijeli run zbog jednog suba
-                print(f"[upozorenje] {sub_name}: {e}", file=sys.stderr)
+            except Exception as e:
+                print(f"[upozorenje] {sub_name} (new): {e}", file=sys.stderr)
+
+            # 2) najpopularniji postovi ovog tjedna (da ne promašimo "viralne" teme)
+            try:
+                for post in fetch_posts(sub_name, "top", TOP_WEEK_PER_SUBREDDIT, {"t": "week"}):
+                    title = post.get("title", "") or ""
+                    selftext = post.get("selftext", "") or ""
+                    hits = find_matches(f"{title}\n{selftext}")
+                    if not hits:
+                        continue
+                    rows.append(make_row(
+                        group, sub_name, "post_top_week", post.get("id", ""), title, selftext,
+                        post.get("score", 0), post.get("num_comments", 0),
+                        post.get("created_utc", 0),
+                        f"https://www.reddit.com{post.get('permalink', '')}", hits,
+                    ))
+                time.sleep(REQUEST_DELAY_SECONDS)
+            except Exception as e:
+                print(f"[upozorenje] {sub_name} (top): {e}", file=sys.stderr)
+
+            # 3) najnoviji komentari (tu se krije najviše pravih pritužbi)
+            try:
+                for comment in fetch_comments(sub_name, COMMENTS_PER_SUBREDDIT):
+                    body = comment.get("body", "") or ""
+                    hits = find_matches(body)
+                    if not hits:
+                        continue
+                    title = f"[komentar] {body[:80].strip()}"
+                    rows.append(make_row(
+                        group, sub_name, "comment", comment.get("id", ""), title, body,
+                        comment.get("score", 0), 0,
+                        comment.get("created_utc", 0),
+                        comment_url(sub_name, comment), hits,
+                    ))
+                time.sleep(REQUEST_DELAY_SECONDS)
+            except Exception as e:
+                print(f"[upozorenje] {sub_name} (comments): {e}", file=sys.stderr)
 
     return rows
 
 
 def write_latest(rows):
     os.makedirs(DATA_DIR, exist_ok=True)
-    fieldnames = [
-        "post_id", "scanned_at", "group", "subreddit", "buckets",
-        "matched_keywords", "cjenko_relevant", "score", "num_comments",
-        "created_utc", "title", "snippet", "url",
-    ]
     with open(LATEST_CSV, "w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
-        for row in sorted(rows, key=lambda r: r["score"], reverse=True):
+        for row in sorted(rows, key=lambda r: r["composite_score"], reverse=True):
             writer.writerow(row)
 
 
@@ -165,18 +261,40 @@ def append_history(rows):
     seen_ids = load_existing_ids()
     new_rows = [r for r in rows if r["post_id"] not in seen_ids]
     file_exists = os.path.exists(HISTORY_CSV)
-    fieldnames = [
-        "post_id", "scanned_at", "group", "subreddit", "buckets",
-        "matched_keywords", "cjenko_relevant", "score", "num_comments",
-        "created_utc", "title", "snippet", "url",
-    ]
     with open(HISTORY_CSV, "a", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=fieldnames)
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         if not file_exists:
             writer.writeheader()
         for row in new_rows:
             writer.writerow(row)
     return new_rows
+
+
+def load_history_rows():
+    if not os.path.exists(HISTORY_CSV):
+        return []
+    with open(HISTORY_CSV, newline="", encoding="utf-8") as f:
+        return list(csv.DictReader(f))
+
+
+def recurring_themes(history_rows):
+    """Fraze koje su se pojavile u >= RECURRING_MIN_WEEKS različitih tjedana."""
+    phrase_weeks = defaultdict(set)
+    for row in history_rows:
+        try:
+            dt = datetime.fromisoformat(row["scanned_at"])
+        except (KeyError, ValueError):
+            continue
+        week_key = dt.strftime("%G-W%V")
+        for phrase in (row.get("matched_keywords") or "").split(";"):
+            if phrase:
+                phrase_weeks[phrase].add(week_key)
+    recurring = [
+        (phrase, len(weeks)) for phrase, weeks in phrase_weeks.items()
+        if len(weeks) >= RECURRING_MIN_WEEKS
+    ]
+    recurring.sort(key=lambda x: x[1], reverse=True)
+    return recurring
 
 
 def top_words(rows, n=15):
@@ -188,22 +306,30 @@ def top_words(rows, n=15):
     return counts.most_common(n)
 
 
-def write_summary(new_rows, all_rows):
+def write_summary(new_rows, history_rows):
     os.makedirs(DATA_DIR, exist_ok=True)
     now = datetime.now(timezone.utc).strftime("%Y-%m-%d")
     lines = [f"# Reddit sažetak — {now}", ""]
 
-    lines.append(f"Novih pogodaka ovaj tjedan: **{len(new_rows)}** (ukupno u povijesti: {len(all_rows) if all_rows else len(new_rows)})")
+    total = len(history_rows) if history_rows else len(new_rows)
+    lines.append(f"Novih pogodaka ovaj tjedan: **{len(new_rows)}** (ukupno u povijesti: {total})")
     lines.append("")
 
     relevant = [r for r in new_rows if r["cjenko_relevant"] == "da"]
     lines.append(f"Od toga potencijalno relevantno za Cjenko Akcije (cijene/kupovina): **{len(relevant)}**")
     lines.append("")
 
+    recurring = recurring_themes(history_rows)
+    if recurring:
+        lines.append(f"## Ponavljajuće teme (fraza spomenuta u {RECURRING_MIN_WEEKS}+ različitih tjedana — jači signal)")
+        for phrase, weeks in recurring[:10]:
+            lines.append(f"- \"{phrase}\" — {weeks} tjedana")
+        lines.append("")
+
     if relevant:
-        lines.append("## Cjenko-relevantno (top 10 po bodovima)")
-        for r in sorted(relevant, key=lambda r: r["score"], reverse=True)[:10]:
-            lines.append(f"- [{r['title']}]({r['url']}) — r/{r['subreddit']}, {r['buckets']}, {r['score']} bodova")
+        lines.append("## Cjenko-relevantno (top 10 po composite_score)")
+        for r in sorted(relevant, key=lambda r: int(r["composite_score"]), reverse=True)[:10]:
+            lines.append(f"- [{r['title']}]({r['url']}) — r/{r['subreddit']} ({r['content_type']}), {r['buckets']}, score {r['composite_score']}")
         lines.append("")
 
     for bucket in ["traži_app", "feature_request", "pritužba"]:
@@ -215,14 +341,14 @@ def write_summary(new_rows, all_rows):
             "feature_request": "Traže da netko napravi app",
             "pritužba": "Pritužbe",
         }[bucket]
-        lines.append(f"## {label} (top 8)")
-        for r in sorted(bucket_rows, key=lambda r: r["score"], reverse=True)[:8]:
-            lines.append(f"- [{r['title']}]({r['url']}) — r/{r['subreddit']}, {r['score']} bodova")
+        lines.append(f"## {label} (top 8 po composite_score)")
+        for r in sorted(bucket_rows, key=lambda r: int(r["composite_score"]), reverse=True)[:8]:
+            lines.append(f"- [{r['title']}]({r['url']}) — r/{r['subreddit']} ({r['content_type']}), score {r['composite_score']}")
         lines.append("")
 
     words = top_words(new_rows)
     if words:
-        lines.append("## Najčešće riječi u naslovima pogodaka (grubi signal tema)")
+        lines.append("## Najčešće riječi u naslovima/komentarima pogodaka (grubi signal tema)")
         lines.append(", ".join(f"{w} ({c})" for w, c in words))
         lines.append("")
 
@@ -234,7 +360,8 @@ def main():
     rows = scan()
     write_latest(rows)
     new_rows = append_history(rows)
-    write_summary(new_rows, rows)
+    history_rows = load_history_rows()
+    write_summary(new_rows, history_rows)
     print(f"Gotovo: {len(rows)} ukupno pogodaka, {len(new_rows)} novih.")
 
 

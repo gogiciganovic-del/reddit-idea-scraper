@@ -1,9 +1,15 @@
 # reddit-idea-scraper
 
-Besplatni tjedni skener Reddita koji traži:
-- **pritužbe** ("mrzim kad...", "frustrira me...")
+Besplatni tjedni skener Reddita (v2) koji traži:
+- **pritužbe** ("mrzim kad...", "frustrira me...", plus puno neformalnih varijanti)
 - **feature-request-ove** ("trebao bih app koji...", "zašto ne postoji...")
 - **direktna pitanja za app** ("postoji li app koji...")
+
+Skenira i **postove** (najnovije + top tjedna, da ne promaši popularne
+teme) i **komentare** (tu se krije najviše pravih pritužbi), rangira sve
+po `composite_score` (glasovi + komentari + broj poklopljenih fraza), i
+prati koje se fraze **ponavljaju kroz više tjedana** — to je jači signal
+prave poslovne prilike nego jednokratan spomen.
 
 u tri skupine subreddita:
 - hrvatski (`r/croatia`, `r/zagreb`, `r/askcroatia`)
