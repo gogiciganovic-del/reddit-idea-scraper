@@ -21,24 +21,31 @@ heuristički signal spominje li post cijene/kupovinu/trgovine, dakle je
 li to nešto što bi Cjenko Akcije mogao pokriti, ili je to prilika za
 potpuno novu app.
 
-**Bez Reddit API ključa.** Reddit je 2026. zatvorio izradu novih
-"legacy API" aplikacija za obične korisnike (samo uz odobren
-moderacijski use-case), pa ovaj skener umjesto toga koristi Redditove
-javne, besplatne JSON feedove (`reddit.com/r/<sub>/new.json`), koji ne
-traže prijavu ni ključ. Jedino se GitHub Actions runner (koji ima pun
-pristup internetu) koristi za dohvat — ne vrti se lokalno ni u
-ograničenom sandboxu.
+**Status: automatski Python scraper NE RADI.** Isprobano je:
+1. Redditov službeni API preko PRAW-a — Reddit je 2026. zatvorio izradu
+   novih "legacy API" aplikacija za obične korisnike (samo uz odobren
+   moderacijski use-case); registracija nove app tiho ne uspijeva.
+2. Javni, besplatni JSON feed (`reddit.com/r/<sub>/new.json`) bez
+   ključa — Reddit vraća HTTP 403 "Blocked" na sve zahtjeve s GitHub
+   Actions / cloud IP adresa (anti-bot zaštita na razini infrastrukture,
+   ne nešto što user-agent ili delay mogu zaobići).
 
-Sve besplatno: bez API ključa, bez plaćanja, GitHub Actions free-tier
-minuti (isti pattern kao `prices-crawl.yml` u `akcija-hr`).
+Oba pokušaja su ostala u repou (`scraper/`) kao referenca, i
+`workflow_dispatch` i dalje radi za ručno eksperimentiranje, ali
+**tjedni cron je isključen** jer bi uvijek vraćao 0 pogodaka.
+
+**Kako tjedno istraživanje stvarno radi sada:** Claude (u zasebnoj
+scheduled-task sesiji, izvan ovog repoa) svaki ponedjeljak sam
+pretražuje web (WebSearch) za relevantne Reddit rasprave — to ne
+izgleda kao bot pa nije blokirano — i šalje sažetak izravno u chat.
+Nalazi se po mogućnosti commitaju natrag u `data/history.csv` ovog
+repoa radi praćenja kroz vrijeme, preko GitHub API-ja.
 
 ## Postavljanje
 
-Ništa nije potrebno postaviti — nema secrets, nema API ključa. Workflow
-se sam pokreće svaki ponedjeljak preko GitHub Actions.
-
-Za ručno pokretanje: repo → Actions → "Tjedni Reddit skener ideja" →
-"Run workflow".
+Ništa nije potrebno postaviti na ovoj strani — nema secrets, nema API
+ključa. Tjedni posao se odvija automatski kroz Claudeov scheduled task,
+ne kroz GitHub Actions cron (vidi gore).
 
 ## Izlaz
 

@@ -1,10 +1,13 @@
 name: Tjedni Reddit skener ideja
 
 on:
-  schedule:
-    # Svaki ponedjeljak u 07:13 UTC (08:13 po hrvatskom vremenu zimi / 09:13 ljeti)
-    - cron: "13 7 * * 1"
-  workflow_dispatch: {}   # omogućuje ručno pokretanje s GitHub Actions taba
+  # NAPOMENA: tjedni cron je namjerno isključen. Reddit blokira (HTTP 403)
+  # sve zahtjeve s GitHub Actions/cloud IP adresa, pa bi automatsko
+  # pokretanje uvijek vraćalo 0 pogodaka. Tjedno istraživanje sad radi
+  # Claude izravno (WebSearch), vidi glavni README.md. Ovaj workflow je
+  # ostavljen za ručno pokretanje/eksperimentiranje ako se ikad nađe
+  # drugačiji način pristupa (npr. vlastiti proxy/VPN izvor).
+  workflow_dispatch: {}
 
 jobs:
   scan:
