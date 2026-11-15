@@ -2,9 +2,13 @@
 """
 Tjedni Reddit skener pritužbi i poslovnih ideja.
 
-Koristi SAMO Redditov besplatni službeni API preko PRAW-a, u read-only
-modu (treba samo client_id + client_secret, besplatna "script" app na
-reddit.com/prefs/apps — nema plaćanja, nema korisničke lozinke).
+NE treba Reddit API app/ključ. Koristi Redditove javne, besplatne JSON
+feedove (npr. https://www.reddit.com/r/croatia/new.json) koji su
+dostupni bez prijave i bez OAuth-a — dovoljan je samo pristojan
+User-Agent header. Reddit je u 2026. zatvorio izradu novih "legacy API"
+script-aplikacija za obične korisnike (samo za moderacijske slučajeve
+uz odobrenje), pa ovaj pristup zaobilazi tu prepreku i dalje ostaje
+100% besplatan.
 
 Izlaz:
   data/latest.csv   — svi pogoci (sirovi podaci)
@@ -12,17 +16,19 @@ Izlaz:
   data/history.csv  — kumulativna povijest (append, dedup po post id-u)
 
 Pokreće se tjedno preko GitHub Actions (.github/workflows/reddit-scan.yml),
-potpuno besplatno na GitHub-ovoj infrastrukturi.
+potpuno besplatno na GitHub-ovoj infrastrukturi (koja ima pun pristup
+internetu, za razliku od nekih sandboxed okruženja).
 """
 
 import csv
 import os
 import re
 import sys
+import time
 from collections import Counter
 from datetime import datetime, timezone
 
-import praw
+import requests
 
 from config import SUBREDDITS, POSTS_PER_SUBREDDIT, KEYWORDS, CJENKO_RELEVANT_HINTS
 
@@ -30,6 +36,10 @@ DATA_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__
 LATEST_CSV = os.path.join(DATA_DIR, "latest.csv")
 HISTORY_CSV = os.path.join(DATA_DIR, "history.csv")
 SUMMARY_MD = os.path.join(DATA_DIR, "summary.md")
+
+USER_AGENT = "cjenko-idea-scanner/1.0 (besplatni istrazivacki skener, by u/gogiciganovic-del)"
+REQUEST_DELAY_SECONDS = 2.5  # pristojan razmak između zahtjeva prema Redditu
+PAGE_SIZE = 100  # max koji Reddit dopušta po stranici
 
 STOPWORDS = set(
     "i the a an of to for in on is are was were be been and or but with "
@@ -41,19 +51,36 @@ STOPWORDS = set(
 )
 
 
-def get_reddit():
-    client_id = os.environ.get("REDDIT_CLIENT_ID")
-    client_secret = os.environ.get("REDDIT_CLIENT_SECRET")
-    if not client_id or not client_secret:
-        sys.exit(
-            "Nedostaju REDDIT_CLIENT_ID / REDDIT_CLIENT_SECRET env varijable. "
-            "Postavi ih kao GitHub Actions secrets (vidi README.md)."
-        )
-    return praw.Reddit(
-        client_id=client_id,
-        client_secret=client_secret,
-        user_agent="cjenko-idea-scanner/1.0 (by u/gogiciganovic-del)",
-    )
+def fetch_new_posts(sub_name, limit):
+    """Dohvati najnovije postove s r/<sub_name> preko javnog .json feeda."""
+    posts = []
+    after = None
+    session = requests.Session()
+    session.headers.update({"User-Agent": USER_AGENT})
+
+    while len(posts) < limit:
+        url = f"https://www.reddit.com/r/{sub_name}/new.json"
+        params = {"limit": min(PAGE_SIZE, limit - len(posts))}
+        if after:
+            params["after"] = after
+        resp = session.get(url, params=params, timeout=15)
+        if resp.status_code == 429:
+            print(f"[upozorenje] {sub_name}: rate-limited, čekam 10s...", file=sys.stderr)
+            time.sleep(10)
+            continue
+        resp.raise_for_status()
+        data = resp.json()
+        children = data.get("data", {}).get("children", [])
+        if not children:
+            break
+        for child in children:
+            posts.append(child["data"])
+        after = data.get("data", {}).get("after")
+        if not after:
+            break
+        time.sleep(REQUEST_DELAY_SECONDS)
+
+    return posts
 
 
 def find_matches(text):
@@ -79,16 +106,16 @@ def load_existing_ids():
 
 
 def scan():
-    reddit = get_reddit()
-    seen_ids = load_existing_ids()
     rows = []
 
     for group, subs in SUBREDDITS.items():
         for sub_name in subs:
             try:
-                subreddit = reddit.subreddit(sub_name)
-                for post in subreddit.new(limit=POSTS_PER_SUBREDDIT):
-                    full_text = f"{post.title}\n{getattr(post, 'selftext', '') or ''}"
+                posts = fetch_new_posts(sub_name, POSTS_PER_SUBREDDIT)
+                for post in posts:
+                    title = post.get("title", "") or ""
+                    selftext = post.get("selftext", "") or ""
+                    full_text = f"{title}\n{selftext}"
                     hits = find_matches(full_text)
                     if not hits:
                         continue
@@ -96,23 +123,24 @@ def scan():
                     matched_phrases = sorted({p for _, p in hits})
                     rows.append(
                         {
-                            "post_id": post.id,
+                            "post_id": post.get("id", ""),
                             "scanned_at": datetime.now(timezone.utc).isoformat(timespec="seconds"),
                             "group": group,
                             "subreddit": sub_name,
                             "buckets": ";".join(buckets),
                             "matched_keywords": ";".join(matched_phrases),
                             "cjenko_relevant": "da" if is_cjenko_relevant(full_text) else "ne",
-                            "score": post.score,
-                            "num_comments": post.num_comments,
+                            "score": post.get("score", 0),
+                            "num_comments": post.get("num_comments", 0),
                             "created_utc": datetime.fromtimestamp(
-                                post.created_utc, tz=timezone.utc
+                                post.get("created_utc", 0), tz=timezone.utc
                             ).isoformat(timespec="seconds"),
-                            "title": post.title.replace("\n", " ").strip(),
-                            "snippet": (getattr(post, "selftext", "") or "")[:300].replace("\n", " ").strip(),
-                            "url": f"https://www.reddit.com{post.permalink}",
+                            "title": title.replace("\n", " ").strip(),
+                            "snippet": selftext[:300].replace("\n", " ").strip(),
+                            "url": f"https://www.reddit.com{post.get('permalink', '')}",
                         }
                     )
+                time.sleep(REQUEST_DELAY_SECONDS)
             except Exception as e:  # ne prekidaj cijeli run zbog jednog suba
                 print(f"[upozorenje] {sub_name}: {e}", file=sys.stderr)
 

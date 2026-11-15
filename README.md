@@ -15,30 +15,24 @@ heuristički signal spominje li post cijene/kupovinu/trgovine, dakle je
 li to nešto što bi Cjenko Akcije mogao pokriti, ili je to prilika za
 potpuno novu app.
 
-Sve besplatno: Redditov službeni read-only API (preko `praw`) + GitHub
-Actions (besplatni free-tier minuti, isti pattern kao `prices-crawl.yml`
-u `akcija-hr`).
+**Bez Reddit API ključa.** Reddit je 2026. zatvorio izradu novih
+"legacy API" aplikacija za obične korisnike (samo uz odobren
+moderacijski use-case), pa ovaj skener umjesto toga koristi Redditove
+javne, besplatne JSON feedove (`reddit.com/r/<sub>/new.json`), koji ne
+traže prijavu ni ključ. Jedino se GitHub Actions runner (koji ima pun
+pristup internetu) koristi za dohvat — ne vrti se lokalno ni u
+ograničenom sandboxu.
 
-## Postavljanje (jednom, ~5 min)
+Sve besplatno: bez API ključa, bez plaćanja, GitHub Actions free-tier
+minuti (isti pattern kao `prices-crawl.yml` u `akcija-hr`).
 
-1. **Redditov API ključ (besplatno, bez kartice):**
-   - Idi na https://www.reddit.com/prefs/apps dok si ulogiran na svom Reddit računu.
-   - Klikni "create another app..." (dolje).
-   - Tip: **script**
-   - Name: npr. `cjenko-idea-scanner`
-   - redirect uri: `http://localhost:8080` (mora biti upisano nešto, nije bitno što)
-   - Klikni "create app".
-   - Dobiješ dva podatka:
-     - `client_id` — niz slova/brojeva ispod naziva app-a (ispod "personal use script")
-     - `client_secret` — piše "secret"
+## Postavljanje
 
-2. **Dodaj ih kao GitHub Secrets u ovaj repo:**
-   - Repo → Settings → Secrets and variables → Actions → "New repository secret"
-   - `REDDIT_CLIENT_ID` = client_id s koraka 1
-   - `REDDIT_CLIENT_SECRET` = secret s koraka 1
+Ništa nije potrebno postaviti — nema secrets, nema API ključa. Workflow
+se sam pokreće svaki ponedjeljak preko GitHub Actions.
 
-3. **Gotovo.** Workflow se sam pokreće svaki ponedjeljak. Za ručno
-   pokretanje: repo → Actions → "Tjedni Reddit skener ideja" → "Run workflow".
+Za ručno pokretanje: repo → Actions → "Tjedni Reddit skener ideja" →
+"Run workflow".
 
 ## Izlaz
 
@@ -51,3 +45,11 @@ u `akcija-hr`).
 
 Sve ključne riječi, subreddit liste i broj postova po subredditu su u
 `scraper/config.py` — slobodno dodaj/oduzmi subreddite ili fraze.
+
+## Napomena o ograničenjima javnog feeda
+
+Javni `.json` feed vraća samo najnovije postove (ne pretražuje cijelu
+povijest subreddita), i Reddit ga povremeno rate-limitira ako se zove
+prečesto — skripta to sama čeka i nastavlja. Za tjedni ritam i
+`POSTS_PER_SUBREDDIT = 300` ovo je više nego dovoljno da se ne
+propuste novi postovi između dva pokretanja.
